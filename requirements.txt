@@ -1,0 +1,7 @@
+# Solo para trabajar en local. Las dependencias del contenedor se definen en modal_app.py.
+modal
+ultralytics
+opencv-python-headless
+numpy
+boto3
+httpx
