@@ -3,6 +3,7 @@
 Descarga el vídeo de R2, detecta y sigue jugadores y balón con YOLO + ByteTrack,
 calcula mapas de calor y estadísticas, guarda el resultado en Supabase y borra el vídeo.
 """
+import json
 import os
 import tempfile
 import time
@@ -39,6 +40,15 @@ def _headers(extra=None):
     return h
 
 
+def _json_default(o):
+    """Permite serializar a JSON los tipos de NumPy (float32, int64, arrays...)."""
+    if isinstance(o, np.generic):
+        return o.item()
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    raise TypeError(f"Tipo no serializable: {type(o).__name__}")
+
+
 def get_partido(partido_id):
     r = httpx.get(f"{SUPABASE_URL}/rest/v1/partidos",
                   params={"id": f"eq.{partido_id}", "select": "*", "limit": "1"},
@@ -50,7 +60,8 @@ def get_partido(partido_id):
 
 def patch_partido(partido_id, fields):
     r = httpx.patch(f"{SUPABASE_URL}/rest/v1/partidos", params={"id": f"eq.{partido_id}"},
-                    json=fields, headers=_headers({"Prefer": "return=minimal"}), timeout=60)
+                    content=json.dumps(fields, default=_json_default),
+                    headers=_headers({"Prefer": "return=minimal"}), timeout=60)
     r.raise_for_status()
 
 
@@ -84,7 +95,7 @@ def _agrupar_equipos(colores):
         return {t: 0 for t in colores}
     data = np.float32(list(colores.values()))
     criterios = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.5)
-    _, etiquetas, _ = cv2.kmeans(data, 2, None, criterios, 5, cv2.KMEANS_PP_CENTERS)
+    _, etiquetas, _ = cv2.kmeans(data, 2, None, criterios, 5, cv2.KMEANS_PP_CENTS if False else cv2.KMEANS_PP_CENTERS)
     return dict(zip(colores.keys(), etiquetas.ravel().tolist()))
 
 
@@ -118,6 +129,7 @@ def analizar_video(path, calibracion=None, max_minutes=0.0):
     poss_radius = 3.0 if homog is not None else 0.07
 
     def to_plane(x, y):
+        x, y = float(x), float(y)  # los valores del modelo son float32 de NumPy: se pasan a float de Python
         if homog is None:
             return x / W, y / H
         p = cv2.perspectiveTransform(np.float32([[[x, y]]]), homog)[0][0]
