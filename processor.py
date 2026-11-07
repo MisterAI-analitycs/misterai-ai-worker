@@ -14,6 +14,7 @@ import cv2
 import httpx
 import numpy as np
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
@@ -28,6 +29,10 @@ PITCH_W, PITCH_H = 105.0, 68.0
 MAX_SPEED_MS = 12.0                                         # por encima, el salto se considera ruido
 PERSON_NAMES = {"person", "player", "goalkeeper", "referee", "jugador", "portero", "arbitro", "árbitro"}
 BALL_NAMES = {"sports ball", "ball", "balon", "balón"}
+
+MSG_VIDEO_CADUCADO = ("El vídeo ya no está en el servidor (se borra a las 72 horas). "
+                      "Vuelve a subirlo para analizarlo.")
+MSG_ANALISIS_FALLIDO = "No se pudo completar el análisis. Inténtalo de nuevo; si persiste, contacta con soporte."
 
 
 # ---------- Supabase y R2 ----------
@@ -74,6 +79,22 @@ def r2_client():
     )
 
 
+def _video_no_encontrado(e):
+    """True si el error es que el objeto ya no existe en R2 (borrado por la regla de retención)."""
+    return isinstance(e, ClientError) and e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound")
+
+
+def marcar_error(partido_id, codigo, mensaje, detalle=None, quitar_video=False):
+    """Deja el partido en estado 'error' con un mensaje legible para el panel."""
+    resultados = {"codigo": codigo, "error": mensaje}
+    if detalle:
+        resultados["detalle"] = detalle[:300]  # solo para depuración; el panel no lo muestra
+    campos = {"estado_analisis": "error", "resultados": resultados}
+    if quitar_video:
+        campos["file_path"] = None
+    patch_partido(partido_id, campos)
+
+
 # ---------- Utilidades de visión ----------
 def _color_camiseta(img, box):
     """Color medio (Lab) de la zona del torso, para separar equipos."""
@@ -95,7 +116,7 @@ def _agrupar_equipos(colores):
         return {t: 0 for t in colores}
     data = np.float32(list(colores.values()))
     criterios = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.5)
-    _, etiquetas, _ = cv2.kmeans(data, 2, None, criterios, 5, cv2.KMEANS_PP_CENTS if False else cv2.KMEANS_PP_CENTERS)
+    _, etiquetas, _ = cv2.kmeans(data, 2, None, criterios, 5, cv2.KMEANS_PP_CENTERS)
     return dict(zip(colores.keys(), etiquetas.ravel().tolist()))
 
 
@@ -265,8 +286,12 @@ def run(partido_id, max_minutes=None):
         print(f"Partido {partido_id} ya está en estado {partido['estado_analisis']}; no se repite")
         return
 
-    patch_partido(partido_id, {"estado_analisis": "procesando"})
     key = partido.get("file_path")
+    if not key:  # sin vídeo no hay nada que analizar
+        marcar_error(partido_id, "video_caducado", MSG_VIDEO_CADUCADO)
+        return
+
+    patch_partido(partido_id, {"estado_analisis": "procesando"})
     s3 = r2_client()
     try:
         with tempfile.TemporaryDirectory() as tmp:
@@ -287,4 +312,8 @@ def run(partido_id, max_minutes=None):
         print(f"Partido {partido_id} completado en {resultados['metricas']['tiempo_total_s']} s")
     except Exception as e:
         traceback.print_exc()
-        patch_partido(partido_id, {"estado_analisis": "error", "resultados": {"error": str(e)[:300]}})
+        if _video_no_encontrado(e):
+            # El vídeo ya no existe en R2: se deja constancia y se quita la referencia al archivo.
+            marcar_error(partido_id, "video_caducado", MSG_VIDEO_CADUCADO, str(e), quitar_video=True)
+        else:
+            marcar_error(partido_id, "analisis_fallido", MSG_ANALISIS_FALLIDO, str(e))
