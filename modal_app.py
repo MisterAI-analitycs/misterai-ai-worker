@@ -26,7 +26,10 @@ image = (
 secrets = [modal.Secret.from_name("misterai-secrets")]
 
 
-@app.function(image=image, gpu="A10G", cpu=4, memory=16384, secrets=secrets, timeout=60 * 60, retries=0)
+# scaledown_window=2: el contenedor (y su GPU) se apaga 2 s después de terminar. Por defecto espera
+# 60 s en reposo y esos segundos se facturan.
+@app.function(image=image, gpu="A10G", cpu=4, memory=16384, secrets=secrets, timeout=60 * 60,
+              retries=0, scaledown_window=2)
 def process_match(partido_id: str):
     import processor
 
