@@ -34,6 +34,40 @@ MSG_VIDEO_CADUCADO = ("El vídeo ya no está en el servidor (se borra a las 72 h
                       "Vuelve a subirlo para analizarlo.")
 MSG_ANALISIS_FALLIDO = "No se pudo completar el análisis. Inténtalo de nuevo; si persiste, contacta con soporte."
 
+# Tarifas de Modal (USD por segundo) y recursos de process_match en modal_app.py.
+# Si cambias la GPU, los núcleos o la memoria allí, actualízalos aquí.
+TARIFA_GPU = 0.000306            # Nvidia A10
+NUCLEOS, TARIFA_CPU = 4, 0.0000131   # por núcleo físico
+MEMORIA_GIB, TARIFA_MEM = 16, 0.00000222
+TARIFA_SEGUNDO = TARIFA_GPU + NUCLEOS * TARIFA_CPU + MEMORIA_GIB * TARIFA_MEM
+SCALEDOWN_S = 2                  # espera en reposo antes de apagar el contenedor
+
+
+# ---------- Coste ----------
+def coste_modal(t_run):
+    """Segundos facturables aproximados y coste estimado (USD) de esta ejecución.
+
+    Incluye el arranque del contenedor, medido con la hora de inicio del proceso 1 (acotado a 90 s
+    por si el contenedor se reutiliza). Es una estimación: la factura real de Modal puede diferir.
+    """
+    seg = t_run
+    try:
+        import psutil
+        desde_arranque = time.time() - psutil.Process(1).create_time()
+        seg = min(max(t_run, desde_arranque), t_run + 90)
+    except Exception:
+        pass
+    seg += SCALEDOWN_S
+    return round(seg, 1), round(seg * TARIFA_SEGUNDO, 5)
+
+
+def _acumulado(partido, seg, coste):
+    """Suma esta ejecución a lo ya gastado en el mismo partido (reintentos incluidos)."""
+    return {
+        "modal_segundos": round(float(partido.get("modal_segundos") or 0) + seg, 1),
+        "modal_coste_usd": round(float(partido.get("modal_coste_usd") or 0) + coste, 5),
+    }
+
 
 # ---------- Supabase y R2 ----------
 def _headers(extra=None):
@@ -84,7 +118,7 @@ def _video_no_encontrado(e):
     return isinstance(e, ClientError) and e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound")
 
 
-def marcar_error(partido_id, codigo, mensaje, detalle=None, quitar_video=False):
+def marcar_error(partido_id, codigo, mensaje, detalle=None, quitar_video=False, extra=None):
     """Deja el partido en estado 'error' con un mensaje legible para el panel."""
     resultados = {"codigo": codigo, "error": mensaje}
     if detalle:
@@ -92,6 +126,8 @@ def marcar_error(partido_id, codigo, mensaje, detalle=None, quitar_video=False):
     campos = {"estado_analisis": "error", "resultados": resultados}
     if quitar_video:
         campos["file_path"] = None
+    if extra:
+        campos.update(extra)
     patch_partido(partido_id, campos)
 
 
@@ -301,19 +337,24 @@ def run(partido_id, max_minutes=None):
             t_dl = time.time() - t_dl
             resultados = analizar_video(path, partido.get("calibracion"),
                                         MAX_MINUTES if max_minutes is None else max_minutes)
+        t_run = time.time() - t0
+        seg, coste = coste_modal(t_run)
         resultados["metricas"]["tiempo_descarga_s"] = round(t_dl, 1)
-        resultados["metricas"]["tiempo_total_s"] = round(time.time() - t0, 1)
+        resultados["metricas"]["tiempo_total_s"] = round(t_run, 1)
         # Privacidad: el vídeo se borra en cuanto termina el análisis.
-        patch_partido(partido_id, {"estado_analisis": "completado", "resultados": resultados, "file_path": None})
+        patch_partido(partido_id, {"estado_analisis": "completado", "resultados": resultados, "file_path": None,
+                                   **_acumulado(partido, seg, coste)})
         try:
             s3.delete_object(Bucket=R2_BUCKET, Key=key)
         except Exception:
             traceback.print_exc()  # si falla, la regla de ciclo de vida de R2 lo borra
-        print(f"Partido {partido_id} completado en {resultados['metricas']['tiempo_total_s']} s")
+        print(f"Partido {partido_id} completado en {round(t_run, 1)} s (coste Modal estimado: {coste} USD)")
     except Exception as e:
         traceback.print_exc()
+        seg, coste = coste_modal(time.time() - t0)  # un análisis fallido también consume computación
+        extra = _acumulado(partido, seg, coste)
         if _video_no_encontrado(e):
             # El vídeo ya no existe en R2: se deja constancia y se quita la referencia al archivo.
-            marcar_error(partido_id, "video_caducado", MSG_VIDEO_CADUCADO, str(e), quitar_video=True)
+            marcar_error(partido_id, "video_caducado", MSG_VIDEO_CADUCADO, str(e), quitar_video=True, extra=extra)
         else:
-            marcar_error(partido_id, "analisis_fallido", MSG_ANALISIS_FALLIDO, str(e))
+            marcar_error(partido_id, "analisis_fallido", MSG_ANALISIS_FALLIDO, str(e), extra=extra)
