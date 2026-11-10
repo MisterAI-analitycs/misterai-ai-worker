@@ -1,13 +1,16 @@
 """Procesamiento de un partido.
 
 Descarga el vídeo de R2, detecta y sigue jugadores y balón con YOLO + ByteTrack,
-calcula mapas de calor y estadísticas, guarda el resultado en Supabase y borra el vídeo.
+calcula mapas de calor y estadísticas, corta clips de los momentos de más actividad,
+guarda el resultado en Supabase y borra el vídeo original. Los clips duran 72 horas.
 """
 import json
 import os
+import subprocess
 import tempfile
 import time
 import traceback
+from datetime import datetime, timedelta, timezone
 
 import boto3
 import cv2
@@ -24,6 +27,9 @@ WEIGHTS = os.environ.get("MODEL_WEIGHTS", "/models/yolov8m.pt")  # pesos propios
 IMGSZ = int(os.environ.get("IMGSZ", "1280"))
 TARGET_FPS = float(os.environ.get("TARGET_FPS", "5"))      # fotogramas por segundo analizados
 MAX_MINUTES = float(os.environ.get("MAX_MINUTES", "0"))    # 0 = partido completo (la prueba gratis usa 45)
+MAX_CLIPS = int(os.environ.get("MAX_CLIPS", "5"))          # clips por partido
+CLIP_SECONDS = float(os.environ.get("CLIP_SECONDS", "12")) # duración de cada clip
+CLIP_HORAS = 72                                             # tiempo que se conservan los clips
 GRID_W, GRID_H = 52, 34
 PITCH_W, PITCH_H = 105.0, 68.0
 MAX_SPEED_MS = 12.0                                         # por encima, el salto se considera ruido
@@ -131,6 +137,57 @@ def marcar_error(partido_id, codigo, mensaje, detalle=None, quitar_video=False, 
     patch_partido(partido_id, campos)
 
 
+# ---------- Clips ----------
+def elegir_momentos(energia, duracion_s):
+    """Elige los instantes de mayor movimiento del vídeo (jugadores y cámara) para cortar clips.
+
+    'energia' es {segundo: [diferencia media entre fotogramas consecutivos]}. Es un criterio simple:
+    no reconoce tiros ni pases, solo los momentos de más actividad.
+    """
+    if not energia or duracion_s < 8:
+        return []
+    n = int(duracion_s) + 1
+    serie = np.zeros(n)
+    for s, vals in energia.items():
+        if 0 <= s < n:
+            serie[s] = float(np.mean(vals))
+    suave = np.convolve(serie, np.ones(5) / 5, mode="same")
+    n_clips = max(1, min(MAX_CLIPS, int(duracion_s // 45)))  # un clip por cada ~45 s analizados
+    separacion = int(CLIP_SECONDS * 1.5)
+    momentos = []
+    for _ in range(n_clips):
+        t = int(np.argmax(suave))
+        if suave[t] <= 0:
+            break
+        inicio = max(0.0, t - CLIP_SECONDS * 0.35)
+        fin = min(duracion_s, inicio + CLIP_SECONDS)
+        if fin - inicio >= 4:
+            momentos.append({"inicio_s": round(inicio, 1), "fin_s": round(fin, 1), "intensidad": round(float(suave[t]), 2)})
+        suave[max(0, t - separacion): t + separacion + 1] = 0
+    return sorted(momentos, key=lambda m: m["inicio_s"])
+
+
+def generar_clips(path, momentos, partido_id, s3, tmp):
+    """Corta cada momento con ffmpeg (720p, H.264 compatible con navegadores) y lo sube a R2."""
+    clips = []
+    expira = (datetime.now(timezone.utc) + timedelta(hours=CLIP_HORAS)).isoformat()
+    for i, m in enumerate(momentos, start=1):
+        salida = os.path.join(tmp, f"clip{i}.mp4")
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(m["inicio_s"]), "-i", path,
+                 "-t", str(round(m["fin_s"] - m["inicio_s"], 1)), "-vf", "scale=-2:720",
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-c:a", "aac", "-b:a", "96k",
+                 "-movflags", "+faststart", salida],
+                check=True, timeout=300)
+            key = f"clips/{partido_id}/{i}.mp4"
+            s3.upload_file(salida, R2_BUCKET, key, ExtraArgs={"ContentType": "video/mp4"})
+            clips.append({"n": i, "key": key, "titulo": "Momento de alta actividad", "expira": expira, **m})
+        except Exception:
+            traceback.print_exc()  # un clip que falla no debe tumbar el análisis
+    return clips
+
+
 # ---------- Utilidades de visión ----------
 def _color_camiseta(img, box):
     """Color medio (Lab) de la zona del torso, para separar equipos."""
@@ -204,6 +261,7 @@ def analizar_video(path, calibracion=None, max_minutes=0.0):
 
     grids, nobs, sumxy, dist, last, muestras, poss = {}, {}, {}, {}, {}, {}, {}
     ball_traj, ball_frames, frames_done, poss_frames = [], 0, 0, 0
+    energia, gris_previo = {}, None  # movimiento entre fotogramas, por segundo (para elegir clips)
 
     t_inf = time.time()
     stream = model.track(source=path, stream=True, persist=True, tracker="bytetrack.yaml", vid_stride=stride,
@@ -213,6 +271,12 @@ def analizar_video(path, calibracion=None, max_minutes=0.0):
         if frame_idx >= limit:
             break
         frames_done += 1
+
+        gris = cv2.cvtColor(cv2.resize(r.orig_img, (320, 180)), cv2.COLOR_BGR2GRAY)
+        if gris_previo is not None:
+            energia.setdefault(int(frame_idx / fps), []).append(float(np.mean(cv2.absdiff(gris, gris_previo))))
+        gris_previo = gris
+
         b = r.boxes
         if b is None or len(b) == 0:
             continue
@@ -295,6 +359,7 @@ def analizar_video(path, calibracion=None, max_minutes=0.0):
             "distancia_m": round(dist[tid], 1) if tid in dist else None,
         })
 
+    segundos_analizados = frames_done * stride / fps
     return {
         "version": 1,
         "plano": "campo" if homog is not None else "imagen",
@@ -304,10 +369,11 @@ def analizar_video(path, calibracion=None, max_minutes=0.0):
         "jugadores": jugadores,
         "balon": {"detectado_pct": round(100 * ball_frames / frames_done, 1), "trayectoria": ball_traj},
         "metricas": {
-            "duracion_video_s": round(total / fps, 1), "segundos_analizados": round(frames_done * stride / fps, 1),
+            "duracion_video_s": round(total / fps, 1), "segundos_analizados": round(segundos_analizados, 1),
             "fps_origen": round(fps, 2), "fps_proceso": round(fps / stride, 2), "frames_procesados": frames_done,
             "resolucion": [W, H], "modelo": os.path.basename(WEIGHTS), "tiempo_inferencia_s": round(t_inf, 1),
         },
+        "_momentos": elegir_momentos(energia, min(segundos_analizados, total / fps)),  # interno: lo consume run()
     }
 
 
@@ -337,18 +403,22 @@ def run(partido_id, max_minutes=None):
             t_dl = time.time() - t_dl
             resultados = analizar_video(path, partido.get("calibracion"),
                                         MAX_MINUTES if max_minutes is None else max_minutes)
+            # Los clips se cortan aquí, mientras el vídeo original todavía existe.
+            momentos = resultados.pop("_momentos", [])
+            resultados["clips"] = generar_clips(path, momentos, partido_id, s3, tmp)
         t_run = time.time() - t0
         seg, coste = coste_modal(t_run)
         resultados["metricas"]["tiempo_descarga_s"] = round(t_dl, 1)
         resultados["metricas"]["tiempo_total_s"] = round(t_run, 1)
-        # Privacidad: el vídeo se borra en cuanto termina el análisis.
+        # Privacidad: el vídeo original se borra en cuanto termina el análisis; los clips duran 72 horas.
         patch_partido(partido_id, {"estado_analisis": "completado", "resultados": resultados, "file_path": None,
                                    **_acumulado(partido, seg, coste)})
         try:
             s3.delete_object(Bucket=R2_BUCKET, Key=key)
         except Exception:
             traceback.print_exc()  # si falla, la regla de ciclo de vida de R2 lo borra
-        print(f"Partido {partido_id} completado en {round(t_run, 1)} s (coste Modal estimado: {coste} USD)")
+        print(f"Partido {partido_id} completado en {round(t_run, 1)} s "
+              f"({len(resultados['clips'])} clips, coste Modal estimado: {coste} USD)")
     except Exception as e:
         traceback.print_exc()
         seg, coste = coste_modal(time.time() - t0)  # un análisis fallido también consume computación
